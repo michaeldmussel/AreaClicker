@@ -30,15 +30,22 @@ struct SequenceEditorState {
 #[derive(Clone, Debug)]
 struct ClickEditorState {
     click_name: String,
-    click_min_x: i32,
-    click_max_x: i32,
-    click_min_y: i32,
-    click_max_y: i32,
+    /// X/Y bounds as editable text (not i32) so each field can show the click's own
+    /// name as a gray placeholder while empty, and so users can type coordinates
+    /// directly instead of only picking them from the screen.
+    x_min_text: String,
+    x_max_text: String,
+    y_min_text: String,
+    y_max_text: String,
     selected_display: DisplayChoice,
     drag_start: Option<Pos2>,
     drag_end: Option<Pos2>,
     click_interval_min: f32,
     click_interval_max: f32,
+    /// Name of the click currently loaded via "Edit", if any. Lets Save Click detect a
+    /// rename and cascade it into every sequence step that referenced the old name,
+    /// instead of silently orphaning those steps.
+    editing_original_name: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -127,6 +134,19 @@ fn query_monitors() -> Vec<Monitor> {
             }]
         }
     }
+}
+
+fn sequences_referencing_click(store: &PresetStore, click_name: &str) -> Vec<String> {
+    store
+        .sequences
+        .iter()
+        .filter(|seq| {
+            seq.steps.iter().any(|step| {
+                matches!(step, SequenceStepType::Click { click_name: cn, .. } if cn == click_name)
+            })
+        })
+        .map(|seq| seq.name.clone())
+        .collect()
 }
 
 fn union_rect(monitors: &[Monitor]) -> (i32, i32, i32, i32) {
@@ -363,6 +383,7 @@ impl AppState {
                 eprintln!("Sequence worker panicked");
                 running_clone.store(false, Ordering::Relaxed);
             }
+
         });
 
         self.job = Some(ClickJob { running, paused });
@@ -481,6 +502,22 @@ impl eframe::App for AppState {
                 Color32::from_rgba_premultiplied(128, 128, 128, 100),
             );
 
+            // Gray, semi-transparent watermark naming which click is being defined,
+            // visible for the whole picking gesture (from entry through drag and release)
+            // so the user can't accidentally paint one click's area onto another.
+            if let AppScreen::ClickEditor(editor) = &self.current_screen {
+                let watermark_name = editor.click_name.trim();
+                if !watermark_name.is_empty() {
+                    painter.text(
+                        screen_rect.center_top() + egui::vec2(0.0, 36.0),
+                        egui::Align2::CENTER_TOP,
+                        format!("Selecting zone for \u{201c}{}\u{201d}", watermark_name),
+                        egui::FontId::proportional(30.0),
+                        Color32::from_rgba_unmultiplied(210, 210, 210, 130),
+                    );
+                }
+            }
+
             // Interaction area with drag support
             egui::Area::new(egui::Id::new("location_picker_area"))
                 .order(egui::Order::Foreground)
@@ -524,10 +561,10 @@ impl eframe::App for AppState {
                                 let x2 = (b.x * ppp).round() as i32 + origin_px.0;
                                 let y2 = (b.y * ppp).round() as i32 + origin_px.1;
 
-                                editor.click_min_x = x1.min(x2);
-                                editor.click_max_x = x1.max(x2);
-                                editor.click_min_y = y1.min(y2);
-                                editor.click_max_y = y1.max(y2);
+                                editor.x_min_text = x1.min(x2).to_string();
+                                editor.x_max_text = x1.max(x2).to_string();
+                                editor.y_min_text = y1.min(y2).to_string();
+                                editor.y_max_text = y1.max(y2).to_string();
                                 editor.drag_start = None;
                                 editor.drag_end = None;
                             }
@@ -634,15 +671,16 @@ impl AppState {
                 if ui.button(egui::RichText::new("Manage Clicks").size(20.0)).clicked() {
                     self.current_screen = AppScreen::ClickEditor(ClickEditorState {
                         click_name: String::new(),
-                        click_min_x: 0,
-                        click_max_x: 0,
-                        click_min_y: 0,
-                        click_max_y: 0,
+                        x_min_text: String::new(),
+                        x_max_text: String::new(),
+                        y_min_text: String::new(),
+                        y_max_text: String::new(),
                         selected_display: DisplayChoice::All,
                         drag_start: None,
                         drag_end: None,
                         click_interval_min: 0.5,
                         click_interval_max: 1.0,
+                        editing_original_name: None,
                     });
                 }
 
@@ -962,6 +1000,31 @@ impl AppState {
                         ui.label("Click Name:");
                         ui.text_edit_singleline(&mut editor.click_name);
 
+                        let trimmed_name = editor.click_name.trim();
+                        if !trimmed_name.is_empty() {
+                            let refs = sequences_referencing_click(&self.preset_store, trimmed_name);
+                            if refs.is_empty() {
+                                ui.colored_label(Color32::GRAY, "Not used in any saved sequence yet.");
+                            } else {
+                                ui.colored_label(
+                                    Color32::LIGHT_BLUE,
+                                    format!("Used in {} sequence(s): {}", refs.len(), refs.join(", ")),
+                                );
+                            }
+
+                            if let Some(original_name) = &editor.editing_original_name {
+                                if original_name != trimmed_name {
+                                    ui.colored_label(
+                                        Color32::YELLOW,
+                                        format!(
+                                            "Renaming '{}' → '{}': all sequences using it will be updated on Save.",
+                                            original_name, trimmed_name
+                                        ),
+                                    );
+                                }
+                            }
+                        }
+
                         ui.label("Select Display:");
                         let mut selected_display_str = match editor.selected_display {
                             DisplayChoice::All => "All Displays".to_string(),
@@ -984,8 +1047,38 @@ impl AppState {
                                 }
                             });
 
-                        ui.label(format!("X: {} - {}", editor.click_min_x, editor.click_max_x));
-                        ui.label(format!("Y: {} - {}", editor.click_min_y, editor.click_max_y));
+                        ui.separator();
+                        ui.strong("Zone (X/Y bounds):");
+
+                        let watermark = if trimmed_name.is_empty() { "click name" } else { trimmed_name };
+                        ui.horizontal(|ui| {
+                            ui.label("X:");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut editor.x_min_text)
+                                    .hint_text(watermark)
+                                    .desired_width(70.0),
+                            );
+                            ui.label("-");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut editor.x_max_text)
+                                    .hint_text(watermark)
+                                    .desired_width(70.0),
+                            );
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Y:");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut editor.y_min_text)
+                                    .hint_text(watermark)
+                                    .desired_width(70.0),
+                            );
+                            ui.label("-");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut editor.y_max_text)
+                                    .hint_text(watermark)
+                                    .desired_width(70.0),
+                            );
+                        });
 
                         ui.separator();
 
@@ -1011,20 +1104,46 @@ impl AppState {
                         ui.separator();
 
                         if ui.button("Save Click").clicked() {
-                            let name = editor.click_name.trim();
+                            let name = editor.click_name.trim().to_string();
                             if !name.is_empty() {
-                                let mut click = Click::new(name.to_string(), editor.click_min_x, editor.click_max_x, editor.click_min_y, editor.click_max_y);
+                                let parse = |s: &str| s.trim().parse::<i32>().unwrap_or(0);
+                                let min_x = parse(&editor.x_min_text);
+                                let max_x = parse(&editor.x_max_text);
+                                let min_y = parse(&editor.y_min_text);
+                                let max_y = parse(&editor.y_max_text);
+
+                                let mut click = Click::new(name.clone(), min_x, max_x, min_y, max_y);
                                 click.min_interval = editor.click_interval_min;
                                 click.max_interval = editor.click_interval_max;
+
+                                // If this click was loaded via "Edit" and its name changed,
+                                // cascade the rename into every sequence step that referenced
+                                // the old name instead of leaving them pointing at a dangling click.
+                                if let Some(old_name) = editor.editing_original_name.clone() {
+                                    if old_name != name {
+                                        for seq in self.preset_store.sequences.iter_mut() {
+                                            for step in seq.steps.iter_mut() {
+                                                if let SequenceStepType::Click { click_name, .. } = step {
+                                                    if *click_name == old_name {
+                                                        *click_name = name.clone();
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        self.preset_store.remove_click(&old_name);
+                                    }
+                                }
+
                                 self.preset_store.upsert_click(click);
                                 let _ = self.preset_store.save();
                                 editor.click_name.clear();
-                                editor.click_min_x = 0;
-                                editor.click_max_x = 0;
-                                editor.click_min_y = 0;
-                                editor.click_max_y = 0;
+                                editor.x_min_text.clear();
+                                editor.x_max_text.clear();
+                                editor.y_min_text.clear();
+                                editor.y_max_text.clear();
                                 editor.click_interval_min = 0.5;
                                 editor.click_interval_max = 1.0;
+                                editor.editing_original_name = None;
                             }
                         }
                     });
@@ -1039,21 +1158,31 @@ impl AppState {
 
                         for (click_name, min_x, max_x, min_y, max_y, min_interval, max_interval) in click_list {
                             ui.horizontal(|ui| {
-                                ui.label(format!("{}: X({}-{}) Y({}-{})", click_name, min_x, max_x, min_y, max_y));
+                                let ref_count = sequences_referencing_click(&self.preset_store, &click_name).len();
+                                let usage_suffix = if ref_count == 0 {
+                                    " (unused)".to_string()
+                                } else {
+                                    format!(" (in {} sequence{})", ref_count, if ref_count == 1 { "" } else { "s" })
+                                };
+                                ui.label(format!("{}: X({}-{}) Y({}-{}){}", click_name, min_x, max_x, min_y, max_y, usage_suffix));
 
                                 if ui.button("Edit").clicked() {
                                     editor.click_name = click_name.clone();
-                                    editor.click_min_x = min_x;
-                                    editor.click_max_x = max_x;
-                                    editor.click_min_y = min_y;
-                                    editor.click_max_y = max_y;
+                                    editor.x_min_text = min_x.to_string();
+                                    editor.x_max_text = max_x.to_string();
+                                    editor.y_min_text = min_y.to_string();
+                                    editor.y_max_text = max_y.to_string();
                                     editor.click_interval_min = min_interval;
                                     editor.click_interval_max = max_interval;
+                                    editor.editing_original_name = Some(click_name.clone());
                                 }
 
                                 if ui.button("Delete").clicked() {
                                     self.preset_store.remove_click(&click_name);
                                     let _ = self.preset_store.save();
+                                    if editor.editing_original_name.as_deref() == Some(click_name.as_str()) {
+                                        editor.editing_original_name = None;
+                                    }
                                 }
                             });
                         }
