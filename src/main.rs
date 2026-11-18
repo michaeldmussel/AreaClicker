@@ -1,15 +1,21 @@
+mod cursor;
 mod domain;
-mod human_mouse;
 mod presets;
 
+use crate::cursor::{interruptible_sleep, move_and_click, MoveSettings};
 use crate::domain::validation::{compile_run_plan, CompiledRunPlan, ValidationSeverity};
-use eframe::{egui, egui::{Color32, Pos2, Rect, Sense, WindowLevel}};
+use crate::presets::{Click, ClickSequence, PresetStore, SequenceStepType};
+use eframe::{
+    egui,
+    egui::{Color32, Pos2, Rect, Sense, WindowLevel},
+};
 use enigo::MouseControllable;
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
-use std::sync::{atomic::{AtomicBool, Ordering}, Arc};
-use crate::human_mouse::{HumanMouseSettings, human_move_and_click_interruptible};
-use crate::presets::{PresetStore, Click, ClickSequence, SequenceStepType};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 /// Main application screens - enum-based state machine
 #[derive(Clone, Debug)]
@@ -79,49 +85,22 @@ static ENIGO: Lazy<Mutex<enigo::Enigo>> = Lazy::new(|| Mutex::new(enigo::Enigo::
 // HELPER FUNCTIONS
 // ============================================================================
 
-/// Helper function to perform interruptible sleep.
-fn interruptible_sleep(duration_ms: u64, running: &Arc<AtomicBool>, paused: &Arc<AtomicBool>) {
-    use std::time::Duration;
-    let chunk_size = 50u64;
-    for _ in 0..(duration_ms / chunk_size) {
-        if !running.load(Ordering::Relaxed) {
-            break;
-        }
-        while paused.load(Ordering::Relaxed) {
-            if !running.load(Ordering::Relaxed) {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(chunk_size));
-        }
-        std::thread::sleep(Duration::from_millis(chunk_size));
-    }
-    if !running.load(Ordering::Relaxed) {
-        return;
-    }
-    let remainder = duration_ms % chunk_size;
-    if remainder > 0 {
-        std::thread::sleep(Duration::from_millis(remainder));
-    }
-}
-
 fn query_monitors() -> Vec<Monitor> {
     match display_info::DisplayInfo::all() {
-        Ok(displays) if !displays.is_empty() => {
-            displays
-                .into_iter()
-                .map(|d| Monitor {
-                    id: d.id,
-                    name: if d.is_primary {
-                        format!("Display {} (Primary)", d.id)
-                    } else {
-                        format!("Display {}", d.id)
-                    },
-                    origin_px: (d.x, d.y),
-                    size_px: (d.width as i32, d.height as i32),
-                    scale_factor: d.scale_factor as f32,
-                })
-                .collect()
-        }
+        Ok(displays) if !displays.is_empty() => displays
+            .into_iter()
+            .map(|d| Monitor {
+                id: d.id,
+                name: if d.is_primary {
+                    format!("Display {} (Primary)", d.id)
+                } else {
+                    format!("Display {}", d.id)
+                },
+                origin_px: (d.x, d.y),
+                size_px: (d.width as i32, d.height as i32),
+                scale_factor: d.scale_factor,
+            })
+            .collect(),
         _ => {
             let en = enigo::Enigo::new();
             let (w, h) = en.main_display_size();
@@ -129,7 +108,7 @@ fn query_monitors() -> Vec<Monitor> {
                 id: 0,
                 name: "Main display".to_string(),
                 origin_px: (0, 0),
-                size_px: (w as i32, h as i32),
+                size_px: (w, h),
                 scale_factor: 1.0,
             }]
         }
@@ -299,12 +278,7 @@ impl AppState {
     }
 
     #[allow(dead_code)]
-    fn handle_location_pick(
-        &mut self,
-        pos: Pos2,
-        ppp: f32,
-        ctx: &egui::Context,
-    ) -> (i32, i32) {
+    fn handle_location_pick(&mut self, pos: Pos2, ppp: f32, ctx: &egui::Context) -> (i32, i32) {
         let origin_px = match self.display_choice {
             DisplayChoice::All => {
                 let (min_x, min_y, _max_x, _max_y) = union_rect(&self.monitors);
@@ -320,7 +294,11 @@ impl AppState {
         (x, y)
     }
 
-    fn spawn_sequence(&mut self, sequence_name: String, repetitions: u32) -> Result<CompiledRunPlan, String> {
+    fn spawn_sequence(
+        &mut self,
+        sequence_name: String,
+        repetitions: u32,
+    ) -> Result<CompiledRunPlan, String> {
         if self.job.is_some() {
             return Err("A sequence is already running.".to_string());
         }
@@ -383,7 +361,6 @@ impl AppState {
                 eprintln!("Sequence worker panicked");
                 running_clone.store(false, Ordering::Relaxed);
             }
-
         });
 
         self.job = Some(ClickJob { running, paused });
@@ -409,8 +386,8 @@ fn execute_run_plan(
     last_pos: &mut Option<(i32, i32)>,
     rng: &mut rand::rngs::ThreadRng,
 ) -> Result<(), String> {
-    use rand::Rng;
     use enigo::MouseButton;
+    use rand::Rng;
 
     for step in &plan.steps {
         if !running.load(Ordering::Relaxed) {
@@ -428,13 +405,12 @@ fn execute_run_plan(
                 _ => MouseButton::Left,
             };
 
-            if !human_move_and_click_interruptible(
+            if !move_and_click(
                 &mut *en,
                 from,
                 (click_x, click_y),
-                None,
-                &HumanMouseSettings::default(),
                 button,
+                &MoveSettings::default(),
                 running,
                 paused,
             ) {
@@ -493,7 +469,8 @@ impl eframe::App for AppState {
         // -------- Location Picker Overlay (with drag-based selection) --------
         if self.picking_location {
             let screen_rect = ctx.screen_rect();
-            let layer_id = egui::LayerId::new(egui::Order::Foreground, egui::Id::new("location_picker"));
+            let layer_id =
+                egui::LayerId::new(egui::Order::Foreground, egui::Id::new("location_picker"));
             let painter = egui::Painter::new(ctx.clone(), layer_id, egui::Rect::EVERYTHING);
 
             painter.rect_filled(
@@ -549,10 +526,13 @@ impl eframe::App for AppState {
                                 let ppp = ctx.pixels_per_point().max(0.1);
                                 let origin_px = match self.display_choice {
                                     DisplayChoice::All => {
-                                        let (min_x, min_y, _max_x, _max_y) = union_rect(&self.monitors);
+                                        let (min_x, min_y, _max_x, _max_y) =
+                                            union_rect(&self.monitors);
                                         (min_x, min_y)
                                     }
-                                    DisplayChoice::One(i) => self.monitors.get(i).map(|m| m.origin_px).unwrap_or((0, 0)),
+                                    DisplayChoice::One(i) => {
+                                        self.monitors.get(i).map(|m| m.origin_px).unwrap_or((0, 0))
+                                    }
                                 };
 
                                 // Calculate min/max from drag points
@@ -585,7 +565,10 @@ impl eframe::App for AppState {
                     if let AppScreen::ClickEditor(editor) = &self.current_screen {
                         if let (Some(a), Some(b)) = (editor.drag_start, editor.drag_end) {
                             let rect = Rect::from_two_pos(a, b);
-                            let stroke = egui::Stroke { width: 2.0, color: Color32::LIGHT_BLUE };
+                            let stroke = egui::Stroke {
+                                width: 2.0,
+                                color: Color32::LIGHT_BLUE,
+                            };
                             painter.rect_stroke(rect, 0.0, stroke);
                         }
 
@@ -595,10 +578,13 @@ impl eframe::App for AppState {
                                 let ppp = ctx.pixels_per_point().max(0.1);
                                 let origin_px = match self.display_choice {
                                     DisplayChoice::All => {
-                                        let (min_x, min_y, _max_x, _max_y) = union_rect(&self.monitors);
+                                        let (min_x, min_y, _max_x, _max_y) =
+                                            union_rect(&self.monitors);
                                         (min_x, min_y)
                                     }
-                                    DisplayChoice::One(i) => self.monitors.get(i).map(|m| m.origin_px).unwrap_or((0, 0)),
+                                    DisplayChoice::One(i) => {
+                                        self.monitors.get(i).map(|m| m.origin_px).unwrap_or((0, 0))
+                                    }
                                 };
 
                                 let x = (pos.x * ppp).round() as i32 + origin_px.0;
@@ -658,7 +644,10 @@ impl AppState {
 
                 ui.add_space(30.0);
 
-                if ui.button(egui::RichText::new("Sequences").size(20.0)).clicked() {
+                if ui
+                    .button(egui::RichText::new("Sequences").size(20.0))
+                    .clicked()
+                {
                     self.current_screen = AppScreen::SequenceEditor(SequenceEditorState {
                         sequence_name: String::new(),
                         selected_sequence: None,
@@ -668,7 +657,10 @@ impl AppState {
 
                 ui.add_space(15.0);
 
-                if ui.button(egui::RichText::new("Manage Clicks").size(20.0)).clicked() {
+                if ui
+                    .button(egui::RichText::new("Manage Clicks").size(20.0))
+                    .clicked()
+                {
                     self.current_screen = AppScreen::ClickEditor(ClickEditorState {
                         click_name: String::new(),
                         x_min_text: String::new(),
@@ -704,20 +696,22 @@ impl AppState {
                             ui.label(&seq_name);
 
                             if ui.button("Run").clicked() {
-                                self.current_screen = AppScreen::RunningSequence(RunningSequenceState {
-                                    sequence_name: seq_name.clone(),
-                                    repetitions: 1,
-                                    is_running: false,
-                                    validation_message: None,
-                                });
+                                self.current_screen =
+                                    AppScreen::RunningSequence(RunningSequenceState {
+                                        sequence_name: seq_name.clone(),
+                                        repetitions: 1,
+                                        is_running: false,
+                                        validation_message: None,
+                                    });
                             }
 
                             if ui.button("Edit").clicked() {
-                                self.current_screen = AppScreen::SequenceEditor(SequenceEditorState {
-                                    sequence_name: seq_name.clone(),
-                                    selected_sequence: Some(seq_name.clone()),
-                                    validation_message: None,
-                                });
+                                self.current_screen =
+                                    AppScreen::SequenceEditor(SequenceEditorState {
+                                        sequence_name: seq_name.clone(),
+                                        selected_sequence: Some(seq_name.clone()),
+                                        validation_message: None,
+                                    });
                             }
                         });
                     }
@@ -757,13 +751,20 @@ impl AppState {
                         ui.text_edit_singleline(&mut editor.sequence_name);
 
                         ui.label("Select Existing Sequence:");
-                        let selected_text = editor.selected_sequence.clone().unwrap_or_else(|| "None".into());
+                        let selected_text = editor
+                            .selected_sequence
+                            .clone()
+                            .unwrap_or_else(|| "None".into());
                         egui::ComboBox::from_id_source("seq_select")
                             .selected_text(selected_text)
                             .show_ui(ui, |ui| {
                                 ui.selectable_value(&mut editor.selected_sequence, None, "None");
                                 for seq in &self.preset_store.sequences {
-                                    ui.selectable_value(&mut editor.selected_sequence, Some(seq.name.clone()), &seq.name);
+                                    ui.selectable_value(
+                                        &mut editor.selected_sequence,
+                                        Some(seq.name.clone()),
+                                        &seq.name,
+                                    );
                                 }
                             });
 
@@ -780,9 +781,21 @@ impl AppState {
                     ui.separator();
 
                     // Display and manage sequence steps
-                    if self.preset_store.get_sequence(&editor.sequence_name).is_some() {
-                        let seq_steps: Vec<(usize, SequenceStepType)> = self.preset_store.get_sequence(&editor.sequence_name)
-                            .map(|seq| seq.steps.iter().enumerate().map(|(i, s)| (i, s.clone())).collect())
+                    if self
+                        .preset_store
+                        .get_sequence(&editor.sequence_name)
+                        .is_some()
+                    {
+                        let seq_steps: Vec<(usize, SequenceStepType)> = self
+                            .preset_store
+                            .get_sequence(&editor.sequence_name)
+                            .map(|seq| {
+                                seq.steps
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(i, s)| (i, s.clone()))
+                                    .collect()
+                            })
                             .unwrap_or_default();
 
                         if !seq_steps.is_empty() {
@@ -793,17 +806,34 @@ impl AppState {
                                 for (i, step) in seq_steps.iter() {
                                     ui.horizontal(|ui| {
                                         match step {
-                                            SequenceStepType::Click { click_name, min_interval, max_interval } => {
-                                                ui.label(format!("Step {}: Click '{}' ({:.2}s-{:.2}s)", i + 1, click_name, min_interval, max_interval));
+                                            SequenceStepType::Click {
+                                                click_name,
+                                                min_interval,
+                                                max_interval,
+                                            } => {
+                                                ui.label(format!(
+                                                    "Step {}: Click '{}' ({:.2}s-{:.2}s)",
+                                                    i + 1,
+                                                    click_name,
+                                                    min_interval,
+                                                    max_interval
+                                                ));
                                             }
                                             SequenceStepType::Subsequence { sequence_name } => {
-                                                ui.label(format!("Step {}: Sequence '{}'", i + 1, sequence_name));
+                                                ui.label(format!(
+                                                    "Step {}: Sequence '{}'",
+                                                    i + 1,
+                                                    sequence_name
+                                                ));
                                             }
                                         }
 
                                         // Move up button
                                         if *i > 0 && ui.button("↑").clicked() {
-                                            if let Some(seq_mut) = self.preset_store.get_sequence_mut(&editor.sequence_name) {
+                                            if let Some(seq_mut) = self
+                                                .preset_store
+                                                .get_sequence_mut(&editor.sequence_name)
+                                            {
                                                 seq_mut.steps.swap(*i, i - 1);
                                                 let _ = self.preset_store.save();
                                             }
@@ -811,7 +841,10 @@ impl AppState {
 
                                         // Move down button
                                         if *i < step_count - 1 && ui.button("↓").clicked() {
-                                            if let Some(seq_mut) = self.preset_store.get_sequence_mut(&editor.sequence_name) {
+                                            if let Some(seq_mut) = self
+                                                .preset_store
+                                                .get_sequence_mut(&editor.sequence_name)
+                                            {
                                                 seq_mut.steps.swap(*i, i + 1);
                                                 let _ = self.preset_store.save();
                                             }
@@ -819,7 +852,10 @@ impl AppState {
 
                                         // Delete button
                                         if ui.button("×").clicked() {
-                                            if let Some(seq_mut) = self.preset_store.get_sequence_mut(&editor.sequence_name) {
+                                            if let Some(seq_mut) = self
+                                                .preset_store
+                                                .get_sequence_mut(&editor.sequence_name)
+                                            {
                                                 seq_mut.steps.remove(*i);
                                                 let _ = self.preset_store.save();
                                             }
@@ -830,8 +866,13 @@ impl AppState {
                         }
                     }
 
-                    if self.preset_store.get_sequence(&editor.sequence_name).is_some() {
-                        let validation_report = compile_run_plan(&self.preset_store, &editor.sequence_name, 1);
+                    if self
+                        .preset_store
+                        .get_sequence(&editor.sequence_name)
+                        .is_some()
+                    {
+                        let validation_report =
+                            compile_run_plan(&self.preset_store, &editor.sequence_name, 1);
 
                         ui.group(|ui| {
                             ui.label("Validation Preview:");
@@ -844,7 +885,10 @@ impl AppState {
                             }
 
                             if validation_report.issues.is_empty() {
-                                ui.colored_label(Color32::LIGHT_GREEN, "No validation issues detected.");
+                                ui.colored_label(
+                                    Color32::LIGHT_GREEN,
+                                    "No validation issues detected.",
+                                );
                             } else {
                                 for issue in validation_report.issues.iter().take(4) {
                                     let color = match issue.severity {
@@ -860,22 +904,42 @@ impl AppState {
 
                         ui.group(|ui| {
                             ui.label("Add Step - Click:");
-                            let click_names: Vec<String> = self.preset_store.clicks.iter().map(|c| c.name.clone()).collect();
+                            let click_names: Vec<String> = self
+                                .preset_store
+                                .clicks
+                                .iter()
+                                .map(|c| c.name.clone())
+                                .collect();
                             if !click_names.is_empty() {
                                 let mut selected_click = String::new();
                                 egui::ComboBox::from_id_source("add_click_step")
                                     .selected_text("Select click...")
                                     .show_ui(ui, |ui| {
                                         for click_name in &click_names {
-                                            if ui.selectable_value(&mut selected_click, click_name.clone(), click_name).clicked() {
+                                            if ui
+                                                .selectable_value(
+                                                    &mut selected_click,
+                                                    click_name.clone(),
+                                                    click_name,
+                                                )
+                                                .clicked()
+                                            {
                                                 // Get the click's default intervals first (before mutable borrow)
-                                                let (min_int, max_int) = if let Some(click) = self.preset_store.clicks.iter().find(|c| c.name == *click_name) {
+                                                let (min_int, max_int) = if let Some(click) = self
+                                                    .preset_store
+                                                    .clicks
+                                                    .iter()
+                                                    .find(|c| c.name == *click_name)
+                                                {
                                                     (click.min_interval, click.max_interval)
                                                 } else {
                                                     (0.5, 1.0)
                                                 };
-                                                
-                                                if let Some(seq_mut) = self.preset_store.get_sequence_mut(&editor.sequence_name) {
+
+                                                if let Some(seq_mut) = self
+                                                    .preset_store
+                                                    .get_sequence_mut(&editor.sequence_name)
+                                                {
                                                     seq_mut.steps.push(SequenceStepType::Click {
                                                         click_name: click_name.clone(),
                                                         min_interval: min_int,
@@ -893,7 +957,10 @@ impl AppState {
 
                         ui.group(|ui| {
                             ui.label("Add Step - Subsequence:");
-                            let seq_names: Vec<String> = self.preset_store.sequences.iter()
+                            let seq_names: Vec<String> = self
+                                .preset_store
+                                .sequences
+                                .iter()
                                 .filter(|s| s.name != editor.sequence_name)
                                 .map(|s| s.name.clone())
                                 .collect();
@@ -903,11 +970,23 @@ impl AppState {
                                     .selected_text("Select sequence...")
                                     .show_ui(ui, |ui| {
                                         for seq_name in &seq_names {
-                                            if ui.selectable_value(&mut selected_seq, seq_name.clone(), seq_name).clicked() {
-                                                if let Some(seq_mut) = self.preset_store.get_sequence_mut(&editor.sequence_name) {
-                                                    seq_mut.steps.push(SequenceStepType::Subsequence {
-                                                        sequence_name: seq_name.clone(),
-                                                    });
+                                            if ui
+                                                .selectable_value(
+                                                    &mut selected_seq,
+                                                    seq_name.clone(),
+                                                    seq_name,
+                                                )
+                                                .clicked()
+                                            {
+                                                if let Some(seq_mut) = self
+                                                    .preset_store
+                                                    .get_sequence_mut(&editor.sequence_name)
+                                                {
+                                                    seq_mut.steps.push(
+                                                        SequenceStepType::Subsequence {
+                                                            sequence_name: seq_name.clone(),
+                                                        },
+                                                    );
                                                     let _ = self.preset_store.save();
                                                 }
                                             }
@@ -936,22 +1015,26 @@ impl AppState {
 
                     ui.horizontal(|ui| {
                         if ui.button("Run").clicked() {
-                            let run_name = if self.preset_store.get_sequence(&editor.sequence_name).is_some() {
+                            let run_name = if self
+                                .preset_store
+                                .get_sequence(&editor.sequence_name)
+                                .is_some()
+                            {
                                 Some(editor.sequence_name.clone())
                             } else {
-                                editor
-                                    .selected_sequence
-                                    .as_ref()
-                                    .and_then(|name| self.preset_store.get_sequence(name).map(|_| name.clone()))
+                                editor.selected_sequence.as_ref().and_then(|name| {
+                                    self.preset_store.get_sequence(name).map(|_| name.clone())
+                                })
                             };
 
                             if let Some(name) = run_name {
-                                self.current_screen = AppScreen::RunningSequence(RunningSequenceState {
-                                    sequence_name: name,
-                                    repetitions: 1,
-                                    is_running: false,
-                                    validation_message: editor.validation_message.clone(),
-                                });
+                                self.current_screen =
+                                    AppScreen::RunningSequence(RunningSequenceState {
+                                        sequence_name: name,
+                                        repetitions: 1,
+                                        is_running: false,
+                                        validation_message: editor.validation_message.clone(),
+                                    });
                             } else {
                                 editor.validation_message = Some(
                                     "Select or create a valid sequence before running.".to_string(),
@@ -1030,7 +1113,7 @@ impl AppState {
                             DisplayChoice::All => "All Displays".to_string(),
                             DisplayChoice::One(i) => format!("Display {}", i + 1),
                         };
-                        
+
                         egui::ComboBox::from_id_source("select_display_for_click")
                             .selected_text(&selected_display_str)
                             .show_ui(ui, |ui| {
@@ -1097,7 +1180,7 @@ impl AppState {
                         });
 
                         if ui.button("Pick Location from Screen").clicked() {
-                            self.display_choice = editor.selected_display.clone();
+                            self.display_choice = editor.selected_display;
                             self.enter_location_picker(ctx);
                         }
 
@@ -1304,7 +1387,6 @@ impl AppState {
 
         self.current_screen = AppScreen::RunningSequence(running);
     }
-
 }
 
 fn main() -> eframe::Result<()> {

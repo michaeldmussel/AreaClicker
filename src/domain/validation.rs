@@ -79,31 +79,30 @@ pub fn compile_run_plan(
 
     let mut steps = Vec::new();
     let mut stack = vec![sequence.name.clone()];
-    compile_sequence_inner(
-        store,
-        sequence,
-        &mut stack,
-        0,
-        &mut steps,
-        &mut issues,
-    );
+    compile_sequence_inner(store, sequence, &mut stack, 0, &mut steps, &mut issues);
 
     if steps.is_empty() {
         issues.push(ValidationIssue {
             severity: ValidationSeverity::Error,
-            message: format!("Sequence '{}' has no executable click steps.", sequence_name),
+            message: format!(
+                "Sequence '{}' has no executable click steps.",
+                sequence_name
+            ),
         });
     }
 
-    if issues.iter().any(|issue| issue.severity == ValidationSeverity::Error) {
+    if issues
+        .iter()
+        .any(|issue| issue.severity == ValidationSeverity::Error)
+    {
         return ValidationReport { issues, plan: None };
     }
 
     let estimated_step_ms: u64 = steps
         .iter()
         .map(|step| {
-            let interval_ms = ((step.min_interval_secs + step.max_interval_secs) * 500.0)
-                .max(0.0) as u64;
+            let interval_ms =
+                ((step.min_interval_secs + step.max_interval_secs) * 500.0).max(0.0) as u64;
             interval_ms + 250
         })
         .sum();
@@ -186,12 +185,8 @@ fn compile_sequence_inner(
                     continue;
                 }
 
-                let (min_interval_secs, max_interval_secs) = normalize_delay(
-                    *min_interval,
-                    *max_interval,
-                    &click.name,
-                    issues,
-                );
+                let (min_interval_secs, max_interval_secs) =
+                    normalize_delay(*min_interval, *max_interval, &click.name, issues);
 
                 steps.push(PlannedStep {
                     click_name: click.name.clone(),

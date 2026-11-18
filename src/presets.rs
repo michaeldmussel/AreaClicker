@@ -58,9 +58,7 @@ pub enum SequenceStepType {
         max_interval: f32,
     },
     /// Include all steps from another saved sequence
-    Subsequence {
-        sequence_name: String,
-    },
+    Subsequence { sequence_name: String },
 }
 
 /// A sequence of steps (clicks and/or subsequences)
@@ -79,7 +77,7 @@ pub struct PresetStore {
     /// All saved clicks
     #[serde(default)]
     pub clicks: Vec<Click>,
-    
+
     /// All saved sequences
     #[serde(default)]
     pub sequences: Vec<ClickSequence>,
@@ -157,11 +155,10 @@ impl BoundsSerde {
     }
 }
 
-
 fn preset_path() -> io::Result<PathBuf> {
     // You can change these identifiers if you want.
     let proj = ProjectDirs::from("com", "AreaClicker", "AreaClicker")
-        .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Could not resolve config directory"))?;
+        .ok_or_else(|| io::Error::other("Could not resolve config directory"))?;
 
     let dir = proj.config_dir();
     fs::create_dir_all(dir)?;
@@ -170,10 +167,7 @@ fn preset_path() -> io::Result<PathBuf> {
 
 impl PresetStore {
     pub fn load_or_default() -> Self {
-        match Self::load() {
-            Ok(s) => s,
-            Err(_) => Self::default(),
-        }
+        Self::load().unwrap_or_default()
     }
 
     pub fn load() -> io::Result<Self> {
@@ -182,28 +176,29 @@ impl PresetStore {
             return Ok(Self::default());
         }
         let txt = fs::read_to_string(path)?;
-        let store: Self = toml::from_str(&txt)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("TOML parse error: {e}")))?;
+        let store: Self = toml::from_str(&txt).map_err(|e| {
+            io::Error::new(io::ErrorKind::InvalidData, format!("TOML parse error: {e}"))
+        })?;
         Ok(store)
     }
 
     pub fn save(&self) -> io::Result<()> {
         let path = preset_path()?;
         let txt = toml::to_string_pretty(self)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("TOML serialize error: {e}")))?;
+            .map_err(|e| io::Error::other(format!("TOML serialize error: {e}")))?;
         fs::write(path, txt)?;
         Ok(())
     }
 
     // ========== CLICK MANAGEMENT ==========
-    
+
     pub fn upsert_click(&mut self, click: Click) {
         if let Some(existing) = self.clicks.iter_mut().find(|c| c.name == click.name) {
             *existing = click;
         } else {
             self.clicks.push(click);
         }
-        self.clicks.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        self.clicks.sort_by_key(|a| a.name.to_lowercase());
     }
 
     pub fn remove_click(&mut self, name: &str) {
@@ -227,7 +222,7 @@ impl PresetStore {
         } else {
             self.sequences.push(sequence);
         }
-        self.sequences.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        self.sequences.sort_by_key(|a| a.name.to_lowercase());
     }
 
     pub fn remove_sequence(&mut self, name: &str) {
@@ -251,7 +246,7 @@ impl PresetStore {
         } else {
             self.presets.push(preset);
         }
-        self.presets.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        self.presets.sort_by_key(|a| a.name.to_lowercase());
     }
 
     #[allow(dead_code)]
